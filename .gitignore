@@ -1,2 +1,4 @@
 /sequence_data.jl
 /trained_model.keras
+/history/
+/outputlog.txt
