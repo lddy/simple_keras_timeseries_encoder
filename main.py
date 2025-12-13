@@ -1,3 +1,5 @@
+import os
+
 from models import *
 from model_definitions import *
 import pandas as pd
@@ -6,36 +8,41 @@ import joblib
 from sklearn.metrics import confusion_matrix
 from sklearn.preprocessing import MinMaxScaler
 from keras.utils import plot_model
+from datetime import datetime
+import misc_utils
+from timeit import default_timer as timer
 
+rebuild_sequences = False
+test_only = False # when True, the model will be loaded from file, instead of being (re)fitted
+continue_training = False
+
+model_type = 'transformer-encoder'
 data_file = 'weather_data_with_forecasts_and_hat_state.csv'
 cached_sequence_X_y_data = 'sequence_data.jl'
 cached_model = 'trained_model.keras'
 
 seq_len = 30
-xcols = ['new_hat', 'HolidayTomorrow', 'Temp_NextForecast', 'Prec_NextForecast', 'WeekendTomorrow']
+xcols = ['MOY', 'new_hat', 'HolidayTomorrow', 'WeekendTomorrow', 'picnic', 'is_sick',
+         'Temp', 'Temp_NextForecast', 'Prec_NextForecast', 'Precipitation',
+          ]
 ycols = ['hat']
+
 naive_pred_cols = ['naive_prediction']
 train_rows = 14000
-test_rows = 4000
+test_rows = 2500
 # ^ must ^ run ^ with ^ rebuild_sequences == True ^ at ^ least ^ once ^ or
 # ^ after ^ changing ^ any ^ of ^ the ^ above ^ parameters ^
 
-rebuild_sequences = True
 
-# when True, the model will be loaded from file, instead of being re-fitted
-test_only = False
 
 model_parameters = simple_encoder_classifier
-
-l = list(model_parameters._asdict().items())
-
-print(f'Model Parameters:\n  MLA:            {l[2:9]}\n  MLP:            {l[9:14]}\n  OUT:            {l[14:17]}' +
-      f'\n  OPT:            {l[17:21]}\n  TRAIN:          {l[:2]}, {l[21:]}')
+named_params = list(model_parameters._asdict().items())
 
 def shape_data(df: pd.DataFrame,
                xcols: list, ycols: list,
                seq_len:int,
-               train_rows:int = 2000):
+               train_rows:int = 2000,
+               logger:misc_utils.simple_echo_logger = None):
     pred_cols = []
     for yc in ycols:
         df[f'{yc}_next'] = df[yc].shift(-1)
@@ -65,7 +72,8 @@ def shape_data(df: pd.DataFrame,
 
     stacked_x = None
     stacked_y = None
-    print(f'Collecting {len(rp_indexer)} input sequences')
+    if logger is not None: logger.out(f'Collecting {len(rp_indexer)} input sequences')
+
     for i in rp_indexer.index:
         if i % 200 == 0:
             print(f'\t... processed {i} out of {len(rp_indexer)}...')
@@ -78,7 +86,9 @@ def shape_data(df: pd.DataFrame,
         else:
             stacked_x = np.vstack((stacked_x, curr_seq[None]))
             stacked_y = np.vstack((stacked_y, curr_r[None]))
-    print(f'Sequences ready, {train_rows} train_rows, {test_rows} test_rows\n')
+
+    if logger is not None: logger.out(f'Sequences ready, {train_rows} train_rows, {test_rows} test_rows\n')
+
     train = {}
     test = {}
     train['X'] = stacked_x[:train_rows]
@@ -101,6 +111,7 @@ def configure_model(mc:ModelConfig, x_shape, y_shape):
         bias=mc.bias,
         mh_drop=mc.mh_drop,
         ff_drop=mc.ff_drop,
+        out_pooling = mc.out_pooling,
         num_transformer_blocks=mc.num_transformer_blocks,
         mlp_units=mc.dlayers,
         mlp_activation=mc.dense_act,
@@ -111,10 +122,9 @@ def configure_model(mc:ModelConfig, x_shape, y_shape):
         out_act=mc.out_act,
         out_init=out_init
     )
-    figure_name = f'model_shape{x_shape[0]}-{x_shape[1]}_{x_shape[2]}_MHA-{mc.head_size}x{mc.num_heads}-{mc.ff_dim}_MLP-{mc.dlayers}.png'
+
     model.compile(optimizer=opt, loss=mc.loss, metrics=mc.metrics)
-    model.summary()
-    plot_model(model, to_file=figure_name, show_shapes=True, show_layer_names=True)
+    model.summary(expand_nested=True)
     return model
 
 
@@ -168,15 +178,23 @@ def evaluate_model(model, data, y_flatten = True, batches = -1):
     return {'actual': y_data, 'predictions': predictions}
 
 if __name__ == "__main__":
+    lg = misc_utils.simple_echo_logger('outputlog.txt', append=False)
+
+    time_data_shaping = None
+    time_training = None
+    time_inference = None
+
     if rebuild_sequences:
+        lg.out('rebuilding sequences')
         data = pd.read_csv(data_file)
 
         data = data[xcols + ycols + naive_pred_cols]
         data = data.iloc[:train_rows + test_rows, :]
-
+        t1 = timer()
         clean_data, resp_indexer, train_data, test_data = \
-            shape_data(df = data, xcols = xcols, ycols= ycols, seq_len = seq_len, train_rows=train_rows)
-
+            shape_data(df = data, xcols = xcols, ycols= ycols, seq_len = seq_len, train_rows=train_rows, logger=lg)
+        t2 = timer()
+        time_data_shaping = np.round(t2 - t1, 3)
         sequence_data ={
             'clean_data':clean_data,
             'resp_indexer':resp_indexer,
@@ -193,6 +211,7 @@ if __name__ == "__main__":
             sequence_data['clean_data'], sequence_data['resp_indexer'], sequence_data['train_data'], sequence_data['test_data']
 
     x_shape = train_data['X'].shape
+
     tr_x_unstacked = train_data['X'].reshape(x_shape[0]*x_shape[1], x_shape[2])
     scaler = MinMaxScaler()
     scaler.fit(X = tr_x_unstacked)
@@ -204,40 +223,104 @@ if __name__ == "__main__":
     tst_x_unstacked_scaled = scaler.transform(tst_x_unstacked)
     test_data['X'] = tst_x_unstacked_scaled.reshape(ts_x_shape)
 
-    print('Scaled the data')
+    lg.out('Scaled the data')
 
-    if not test_only:
-        m = configure_model(mc = model_parameters,
-                            x_shape = train_data['X'].shape,
-                            y_shape = (train_data['y'].shape[0], train_data['y'].shape[2]) ) #"flatten" response vectors
-        trained_model, fit_hist = fit_model(model = m,
-                                            mc=model_parameters,
-                                            data = train_data)
-        trained_model.save(cached_model)
+    if model_parameters.pos_enc[0] is not None and model_parameters.pos_enc[0] == 'sinecosine':
+        pe = pos_encoder_sinecosine(seq_len = seq_len, d = x_shape[2])
+        train_data['X'] = apply_pos_encoder(train_data['X'], pe)
+        test_data['X'] = apply_pos_encoder(test_data['X'], pe)
+        lg.out(f'Applied positional encoder ({model_parameters.pos_enc[0]})')
+
+
+    model_string = make_model_name_string(x_shape=x_shape, model_parameters=model_parameters)
+    figure_name = f'{model_string}.png'
+    model_spec = make_model_spec_string(l=named_params)
+    experiment_spec = make_experiment_spec_string(x_shape=x_shape, ts_x_shape=ts_x_shape, model_parameters=model_parameters)
+
+    lg.out(f'model_string: {model_string}')
+    lg.out(model_spec)
+
+    if continue_training or test_only:
+        m = keras.models.load_model(cached_model)
     else:
-        trained_model = keras.models.load_model(cached_model)
+        m = configure_model(mc=model_parameters,
+                            x_shape=train_data['X'].shape,
+                            y_shape=(train_data['y'].shape[0], train_data['y'].shape[2]))  # "flatten" response vectors
+    if not test_only:
+        t1 = timer()
+        m, fit_hist = fit_model(model = m,
+                                mc=model_parameters,
+                                data = train_data)
+        m.save(cached_model)
+        t2 = timer()
+        time_training = np.round(t2 - t1, 3)
 
-    results = evaluate_model(trained_model, test_data, y_flatten = False)
-    results_pd = clean_data.iloc[-ts_x_shape[0]:,:].copy()
-    results_pd['pred'] = results['predictions'][:, 0].tolist()
+    m.summary()
+    plot_model(m,
+               to_file=figure_name,
+               rankdir='BT',
+               show_layer_activations=True,
+               show_shapes=True,
+               show_layer_names=True,
+               dpi = 600)
+
+    t1 = timer()
+    results = evaluate_model(m, test_data, y_flatten = False)
+    t2 = timer()
+    time_inference = np.round(t2 - t1, 3)
+
+    clean_data_trtsonly = clean_data.iloc[resp_indexer.index,:]
+    results_pd = clean_data_trtsonly.iloc[x_shape[0]:,:].copy()
+    if len(results_pd) != results['predictions'].shape[0]:
+        lg.out(f'Warning: different test dataset results in data generation vs eval results:' +
+               f' {len(results_pd)} vs {results["predictions"].shape[0]}', level=1)
+    results_pd['pred'] = results['predictions'].reshape(results['predictions'].shape[0]).tolist()
+    results_pd['actual'] = results['actual'].reshape(results['actual'].shape[0]).tolist()
     results_pd['pred_q'] = results_pd['pred'].apply(lambda x: 0 if x <0.5 else 1)
-
-    print('\nModel-based predictions:')
-    print('confusion matrix')
-    tn, fp, fn, tp = confusion_matrix(results_pd['hat'].to_numpy(),
-                                      results_pd['pred_q'].to_numpy(),
-                                      normalize = 'all').ravel().tolist()
-    print(f'\tTN: {round(tn,2):.2f}\t FP: {round(fp,2):.2f}\n\tFN: {round(fn,2):.2f}\t TP: {round(tp,2):.2f}')
-    print(f'accuracy: {round(tn + tp, 2)}')
-
-    print('\nNaive predictions:')
-    print('confusion matrix')
-    tn, fp, fn, tp = confusion_matrix(results_pd['hat'].to_numpy(),
-                                      results_pd[naive_pred_cols[0]].to_numpy(),
-                                      normalize='all').ravel().tolist()
-    print(f'TN: {round(tn,2):.2f}\t FP: {round(fp,2):.2f}\t\nFN: {round(fn,2):.2f}\t TP: {round(tp,2):.2f}')
-    print(f'accuracy: {round(tn + tp, 2)}\n\n')
-
     results_pd.to_csv('experiment_result.csv')
 
-    print('Done')
+    lg.out('\nModel-based predictions:')
+    lg.out('confusion matrix:')
+    tn, fp, fn, tp = confusion_matrix(results_pd['actual'].to_numpy(),
+                                      results_pd['pred_q'].to_numpy(),
+                                      normalize = 'all').ravel().tolist()
+    cm_model = f'\tTN: {round(tn,2):.2f}\t FP: {round(fp,2):.2f}\n\tFN: {round(fn,2):.2f}\t TP: {round(tp,2):.2f}'
+    lg.out(cm_model)
+    acc_model = round(100*(tn + tp), 1)
+    prec_model, rec_model = round(100* (tp / (tp + fp + 0.0000001)), 1), round(100* (tp / (tp + fn + 0.0000001)), 1)
+    lg.out(f'accuracy: {acc_model}, precision: {prec_model}, recall: {rec_model}')
+
+    lg.out('\nNaive Predictor results:')
+    lg.out('confusion matrix')
+    tn, fp, fn, tp = confusion_matrix(results_pd['hat_next'].to_numpy(),
+                                      results_pd[naive_pred_cols[0]].to_numpy(),
+                                      normalize='all').ravel().tolist()
+    cm_naive = f'\tTN: {round(tn, 2):.2f}\t FP: {round(fp, 2):.2f}\n\tFN: {round(fn, 2):.2f}\t TP: {round(tp, 2):.2f}'
+    lg.out(cm_naive)
+    acc_naive = round(100 * (tn + tp), 1)
+    prec_naive, rec_naive = round(100 * (tp / (tp + fp + 0.0000001)), 1), round(100 * (tp / (tp + fn + 0.0000001)), 1)
+    lg.out(f'accuracy: {acc_naive}, precision: {prec_naive}, recall: {rec_naive}\n')
+
+    model_log_dir = f'./history/{datetime.now().strftime("%m-%d-%y")}/t{datetime.now().strftime("%H%M")}_{model_string}'
+    os.makedirs(model_log_dir, exist_ok = True)
+    exp_filename = f'a{acc_model}_p{prec_model}_r{rec_model}.txt'
+
+    exp_summ = misc_utils.simple_echo_logger(f'{model_log_dir}/{exp_filename}')
+    exp_summ.out(f'{model_type}: {model_string}')
+    exp_summ.out(model_spec)
+    exp_summ.out(experiment_spec)
+
+    exp_summ.out('-------------------------------')
+    exp_summ.out(f'Model results:')
+    exp_summ.out(cm_model)
+    exp_summ.out(f'accuracy: {acc_model}, precision: {prec_model}, recall: {rec_model}')
+    exp_summ.out('-------------------------------')
+    exp_summ.out(f'Naive Predictor results:')
+    exp_summ.out(cm_naive)
+    exp_summ.out(f'accuracy: {acc_naive}, precision: {prec_naive}, recall: {rec_naive}\n')
+
+    exp_summ.out(f'Data shaping time: {time_data_shaping}, Training time: {time_training}, Inference time: {time_inference}')
+    exp_summ.stop()
+    lg.out(f'Data shaping time: {time_data_shaping}, Training time: {time_training}, Inference time: {time_inference}')
+    lg.out('Done')
+    lg.stop()
