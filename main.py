@@ -16,7 +16,7 @@ rebuild_sequences = False
 test_only = False # when True, the model will be loaded from file, instead of being (re)fitted
 continue_training = False
 
-model_type = 'transformer-encoder'
+model_type = 'LSTM' # 'Tr-Enc' 'LSTM'
 data_file = 'weather_data_with_forecasts_and_hat_state.csv'
 cached_sequence_X_y_data = 'sequence_data.jl'
 cached_model = 'trained_model.keras'
@@ -28,14 +28,14 @@ xcols = ['MOY', 'new_hat', 'HolidayTomorrow', 'WeekendTomorrow', 'picnic', 'is_s
 ycols = ['hat']
 
 naive_pred_cols = ['naive_prediction']
-train_rows = 14000
-test_rows = 2500
+train_rows = 15500
+test_rows = 1200
 # ^ must ^ run ^ with ^ rebuild_sequences == True ^ at ^ least ^ once ^ or
 # ^ after ^ changing ^ any ^ of ^ the ^ above ^ parameters ^
 
 
 
-model_parameters = simple_encoder_classifier
+model_parameters = simple_encoder_classifier if model_type == 'Tr-Enc' else lstm_model
 named_params = list(model_parameters._asdict().items())
 
 def shape_data(df: pd.DataFrame,
@@ -99,29 +99,47 @@ def shape_data(df: pd.DataFrame,
 
     return df, rp_indexer, train, test
 
-def configure_model(mc:ModelConfig, x_shape, y_shape):
+def configure_model(mtype:str,
+    mc:ModelConfig, x_shape, y_shape):
     opt = make_optimizer(mc.optimizer[0], mc.optimizer[1], mc.lr)
     out_init = make_initializer(mc.out_init[0],mc.out_init[1])
 
-    model = build_transformer_encoder_model(
-        x_shape[1:],
-        head_size=mc.head_size,
-        num_heads=mc.num_heads,
-        ff_dim=mc.ff_dim if mc.ff_dim is not None else x_shape[2],
-        bias=mc.bias,
-        mh_drop=mc.mh_drop,
-        ff_drop=mc.ff_drop,
-        out_pooling = mc.out_pooling,
-        num_transformer_blocks=mc.num_transformer_blocks,
-        mlp_units=mc.dlayers,
-        mlp_activation=mc.dense_act,
-        mlp_dropout=mc.dense_drop,
-        out_type=mc.out_type,
-        n_classes= y_shape[-1],
-        out_shape= y_shape[-1],
-        out_act=mc.out_act,
-        out_init=out_init
-    )
+    if  mtype == 'Tr-Enc':
+        model = build_transformer_encoder_model(
+            x_shape[1:],
+            head_size=mc.head_size,
+            num_heads=mc.num_heads,
+            ff_dim=mc.ff_dim if mc.ff_dim is not None else x_shape[2],
+            bias=mc.bias,
+            mh_drop=mc.mh_drop,
+            ff_drop=mc.ff_drop,
+            out_pooling = mc.out_pooling,
+            num_transformer_blocks=mc.num_transformer_blocks,
+            mlp_units=mc.dlayers,
+            mlp_activation=mc.dense_act,
+            mlp_dropout=mc.dense_drop,
+            out_type=mc.out_type,
+            n_classes= y_shape[-1],
+            out_shape= y_shape[-1],
+            out_act=mc.out_act,
+            out_init=out_init
+        )
+    elif mtype == 'LSTM':
+        model = build_lstm_model(
+            input_shape = x_shape[1:],
+            num_lstm_layers = mc.num_heads,
+            lstm_dropout = mc.mh_drop,
+            mlp_units = mc.dlayers,
+            mlp_activation = mc.dense_act,
+            mlp_dropout = mc.dense_drop,
+            out_type = y_shape[-1],
+            n_classes = y_shape[-1],
+            out_shape = y_shape[-1],
+            out_act = mc.out_act,
+            out_init = out_init
+        )
+    else:
+        raise NotImplementedError(f'Unknown model type: {mtype}')
 
     model.compile(optimizer=opt, loss=mc.loss, metrics=mc.metrics)
     model.summary(expand_nested=True)
@@ -232,20 +250,24 @@ if __name__ == "__main__":
         lg.out(f'Applied positional encoder ({model_parameters.pos_enc[0]})')
 
 
-    model_string = make_model_name_string(x_shape=x_shape, model_parameters=model_parameters)
+    model_string = make_model_name_string(mtype =model_type, x_shape=x_shape,
+                                          model_parameters=model_parameters)
     figure_name = f'{model_string}.png'
     model_spec = make_model_spec_string(l=named_params)
-    experiment_spec = make_experiment_spec_string(x_shape=x_shape, ts_x_shape=ts_x_shape, model_parameters=model_parameters)
+    experiment_spec = make_experiment_spec_string(mtype =model_type, x_shape=x_shape, ts_x_shape=ts_x_shape,
+                                                  model_parameters=model_parameters)
 
-    lg.out(f'model_string: {model_string}')
+    lg.out(f'{model_type}: {model_string}')
     lg.out(model_spec)
 
     if continue_training or test_only:
         m = keras.models.load_model(cached_model)
     else:
-        m = configure_model(mc=model_parameters,
+        m = configure_model(mtype = model_type,
+                            mc=model_parameters,
                             x_shape=train_data['X'].shape,
-                            y_shape=(train_data['y'].shape[0], train_data['y'].shape[2]))  # "flatten" response vectors
+                            y_shape=(train_data['y'].shape[0], train_data['y'].shape[2]))
+
     if not test_only:
         t1 = timer()
         m, fit_hist = fit_model(model = m,

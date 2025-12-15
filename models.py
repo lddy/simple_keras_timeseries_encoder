@@ -4,8 +4,8 @@ import keras
 from keras.models import Sequential
 import keras.layers as layers
 
-from keras.layers import Dense, LSTM
-from keras.layers import LSTM, InputLayer, Bidirectional, Input, GRU
+
+from keras.layers import LSTM, InputLayer, Bidirectional, Input, GRU, Dense
 from keras.layers import Dropout
 from keras.src.optimizers import Adam, SGD, RMSprop, Adagrad, Lion, AdamW,Adadelta,Adafactor, Nadam,Muon, Adamax
 from keras.initializers import (RandomUniform, RandomNormal, TruncatedNormal,
@@ -119,6 +119,36 @@ def build_transformer_encoder_model(
 
     return keras.Model(inputs, outputs)
 
+def build_lstm_model(
+        input_shape,
+        num_lstm_layers,
+        lstm_dropout,
+        mlp_units,
+        mlp_activation,
+        mlp_dropout,
+        out_type,
+        n_classes,
+        out_shape,
+        out_act,
+        out_init
+    ):
+    inputs = keras.Input(shape=input_shape)
+    x = inputs
+    res = x
+    for i in range(num_lstm_layers):
+        return_sequences = True if i < num_lstm_layers - 1 else False
+        x = layers.LSTM(units = input_shape[-2], return_sequences = return_sequences)(x)
+        x = layers.Dropout(lstm_dropout)(x)
+    for i, dim in enumerate(mlp_units):
+        x = layers.Dense(dim, activation=mlp_activation[i])(x)
+        x = layers.Dropout(mlp_dropout[i])(x)
+    if out_type == 'vect':
+        outputs = layers.Dense(n_classes, activation=out_act, kernel_initializer=out_init)(x)
+    else: #categories
+        outputs = layers.Dense(out_shape, activation=out_act)(x)
+
+    return keras.Model(inputs, outputs)
+
 def pos_encoder_sinecosine(seq_len:int, d:int, n:int=10000):
     r = np.zeros((seq_len, d))
     for k in range(seq_len):
@@ -174,17 +204,3 @@ def make_callback(name:str, params:dict)->Callback:
         return ReduceLROnPlateau(**params)
     raise NotImplementedError(f'make_callback: Unknown callback: ' + name)
 
-def make_model_name_string(x_shape:tuple, model_parameters:ModelConfig)->str:
-    return f'{x_shape[0]}_{x_shape[1]}_{x_shape[2]}_EP-{model_parameters.epoch_num}_MHA-' +\
-                   f'{model_parameters.head_size}x{model_parameters.num_heads}-{model_parameters.ff_dim}_' +\
-                   f'MLP-{model_parameters.dlayers}_Pool{model_parameters.out_pooling}_pos{model_parameters.pos_enc}'
-
-def make_model_spec_string(l:list)->str:
-    model_spec = f'Model Parameters:\n  ' + \
-                 f'MLA:            {l[2:9]}\n  MLP:            {l[9:14]}\n  OUT:            {l[14:18]}' + \
-                 f'\n  OPT:            {l[18:23]}\n  TRAIN:          {l[:2]},{l[23:24]}\n  TRAIN:           {l[24:25]}' + \
-                 f'\n  TRAIN:           {l[25:]}'
-    return model_spec
-def make_experiment_spec_string(x_shape:tuple, ts_x_shape: tuple, model_parameters:ModelConfig)->str:
-    return f'Experiment Parameters: seq_len: {x_shape[1]}, train_rows: {x_shape[0]}, test_rows: {ts_x_shape[0]}\n' +\
-                      f'xcols: {x_shape[2]}\nPositional encodings: f{model_parameters.pos_enc}'
